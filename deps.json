@@ -1,0 +1,6 @@
+{
+  "msquic": {
+    "version": "2.5.5",
+    "repository": "https://github.com/microsoft/msquic.git"
+  }
+}
