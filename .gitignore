@@ -11,3 +11,7 @@ _build
 
 # Virtual environments
 .venv
+
+# Generated stub files
+src/msquic/__init__.pyi
+src/msquic/py.typed
