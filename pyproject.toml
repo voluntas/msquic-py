@@ -25,17 +25,8 @@ Source = "https://github.com/shiguredo/msquic-py"
 Discord = "https://discord.gg/shiguredo"
 
 [dependency-groups]
-dev = [
-    { include-group = "test" },
-    { include-group = "lint" },
-]
-test = [
-    "pytest",
-    "pytest-timeout",
-    "pytest-asyncio",
-    "aioquic",
-    "cryptography",
-]
+dev = [{ include-group = "test" }, { include-group = "lint" }]
+test = ["pytest", "pytest-timeout", "pytest-asyncio", "aioquic", "cryptography"]
 lint = ["ruff", "ty"]
 
 [tool.scikit-build]
@@ -65,8 +56,12 @@ managed = true
 python-preference = "only-managed"
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ty.rules]
+# msquic_ext は C++ 拡張なので解決できない
+unresolved-import = "ignore"

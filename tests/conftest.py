@@ -125,7 +125,8 @@ class QuicServer:
     def _shutdown(self):
         if self._server is not None:
             self._server.close()
-        self._loop.stop()
+        if self._loop is not None:
+            self._loop.stop()
 
     def _run_server(self):
         self._loop = asyncio.new_event_loop()

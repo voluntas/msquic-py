@@ -9,6 +9,7 @@
 // msquic
 #include <msquic.h>
 
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -49,7 +50,6 @@ void close_api() {
 // 前方宣言
 class Stream;
 class Connection;
-QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
 
 // ========== Registration ==========
 class Registration {
@@ -66,9 +66,7 @@ class Registration {
   }
 
   ~Registration() {
-    if (handle_ != nullptr && g_MsQuic != nullptr) {
-      g_MsQuic->RegistrationClose(handle_);
-    }
+    close();
   }
 
   HQUIC handle() const { return handle_; }
@@ -76,6 +74,15 @@ class Registration {
   void shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS flags, uint64_t error_code) {
     if (handle_ != nullptr && g_MsQuic != nullptr) {
       g_MsQuic->RegistrationShutdown(handle_, flags, error_code);
+    }
+  }
+
+  void close() {
+    if (handle_ != nullptr && g_MsQuic != nullptr) {
+      // GIL を解放して MsQuic API を呼び出す
+      nb::gil_scoped_release release;
+      g_MsQuic->RegistrationClose(handle_);
+      handle_ = nullptr;
     }
   }
 
@@ -129,9 +136,7 @@ class Configuration {
   }
 
   ~Configuration() {
-    if (handle_ != nullptr && g_MsQuic != nullptr) {
-      g_MsQuic->ConfigurationClose(handle_);
-    }
+    close();
   }
 
   HQUIC handle() const { return handle_; }
@@ -173,6 +178,15 @@ class Configuration {
     }
   }
 
+  void close() {
+    if (handle_ != nullptr && g_MsQuic != nullptr) {
+      // GIL を解放して MsQuic API を呼び出す
+      nb::gil_scoped_release release;
+      g_MsQuic->ConfigurationClose(handle_);
+      handle_ = nullptr;
+    }
+  }
+
  private:
   HQUIC handle_ = nullptr;
 };
@@ -180,6 +194,9 @@ class Configuration {
 // ========== Stream ==========
 // Stream コールバック用のコンテキスト
 struct StreamContext {
+  std::mutex mutex;
+  std::atomic<bool> is_closing{false};
+  HQUIC handle = nullptr;
   std::function<void(const std::vector<uint8_t>&, bool)> on_receive;
   std::function<void()> on_send_complete;
   std::function<void(uint64_t)> on_peer_send_aborted;
@@ -187,20 +204,23 @@ struct StreamContext {
   std::function<void(bool)> on_shutdown_complete;
 };
 
+// Stream コールバック（前方宣言）
+QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
+
 class Stream {
  public:
   Stream(HQUIC handle) : handle_(handle) {
     context_ = std::make_unique<StreamContext>();
-    g_MsQuic->SetContext(handle_, context_.get());
+    context_->handle = handle;
   }
 
   ~Stream() {
-    if (handle_ != nullptr && g_MsQuic != nullptr) {
-      g_MsQuic->StreamClose(handle_);
-    }
+    // SHUTDOWN_COMPLETE で Close されていない場合のフォールバック
+    // ただし、通常は SHUTDOWN_COMPLETE で Close される
   }
 
   HQUIC handle() const { return handle_; }
+  StreamContext* context() const { return context_.get(); }
 
   void start(QUIC_STREAM_START_FLAGS flags = QUIC_STREAM_START_FLAG_NONE) {
     QUIC_STATUS status = g_MsQuic->StreamStart(handle_, flags);
@@ -218,7 +238,12 @@ class Stream {
     buffer->Length = static_cast<uint32_t>(data.size());
     buffer->Buffer = buf_data;
 
-    QUIC_STATUS status = g_MsQuic->StreamSend(handle_, buffer, 1, flags, buffer);
+    QUIC_STATUS status;
+    {
+      // GIL を解放して MsQuic API を呼び出す
+      nb::gil_scoped_release release;
+      status = g_MsQuic->StreamSend(handle_, buffer, 1, flags, buffer);
+    }
     if (QUIC_FAILED(status)) {
       delete[] buf_data;
       delete buffer;
@@ -234,14 +259,17 @@ class Stream {
   }
 
   void set_on_receive(std::function<void(const std::vector<uint8_t>&, bool)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_receive = std::move(callback);
   }
 
   void set_on_send_complete(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_send_complete = std::move(callback);
   }
 
   void set_on_shutdown_complete(std::function<void(bool)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_shutdown_complete = std::move(callback);
   }
 
@@ -253,10 +281,18 @@ class Stream {
 // Stream コールバック
 QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event) {
   auto* ctx = static_cast<StreamContext*>(context);
+  if (!ctx || ctx->is_closing.load()) {
+    return QUIC_STATUS_SUCCESS;
+  }
 
   switch (event->Type) {
     case QUIC_STREAM_EVENT_RECEIVE: {
-      if (ctx && ctx->on_receive) {
+      std::function<void(const std::vector<uint8_t>&, bool)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_receive;
+      }
+      if (callback) {
         std::vector<uint8_t> data;
         for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
           const auto& buf = event->RECEIVE.Buffers[i];
@@ -264,7 +300,7 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
         }
         bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
         nb::gil_scoped_acquire acquire;
-        ctx->on_receive(data, fin);
+        callback(data, fin);
       }
       break;
     }
@@ -275,30 +311,67 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
         delete[] buffer->Buffer;
         delete buffer;
       }
-      if (ctx && ctx->on_send_complete) {
+      std::function<void()> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_send_complete;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_send_complete();
+        callback();
       }
       break;
     }
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
-      if (ctx && ctx->on_peer_send_aborted) {
+      std::function<void(uint64_t)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_peer_send_aborted;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_peer_send_aborted(event->PEER_SEND_ABORTED.ErrorCode);
+        callback(event->PEER_SEND_ABORTED.ErrorCode);
       }
       break;
     }
     case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
-      if (ctx && ctx->on_peer_receive_aborted) {
+      std::function<void(uint64_t)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_peer_receive_aborted;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_peer_receive_aborted(event->PEER_RECEIVE_ABORTED.ErrorCode);
+        callback(event->PEER_RECEIVE_ABORTED.ErrorCode);
       }
       break;
     }
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
-      if (ctx && ctx->on_shutdown_complete) {
+      // コールバックを呼び出す
+      std::function<void(bool)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_shutdown_complete;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_shutdown_complete(event->SHUTDOWN_COMPLETE.ConnectionShutdown);
+        callback(event->SHUTDOWN_COMPLETE.ConnectionShutdown);
+      }
+      // 循環参照を解消するためにコールバックをクリアする
+      {
+        nb::gil_scoped_acquire acquire;
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->on_receive = nullptr;
+        ctx->on_send_complete = nullptr;
+        ctx->on_peer_send_aborted = nullptr;
+        ctx->on_peer_receive_aborted = nullptr;
+        ctx->on_shutdown_complete = nullptr;
+      }
+      // MsQuic のパターン: SHUTDOWN_COMPLETE で StreamClose を呼び出す
+      // AppCloseInProgress が true の場合、アプリが既に Close を呼んでいるのでスキップ
+      if (!event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
+        ctx->is_closing.store(true);
+        g_MsQuic->StreamClose(stream);
       }
       break;
     }
@@ -310,11 +383,17 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
 
 // ========== Connection ==========
 struct ConnectionContext {
+  std::mutex mutex;
+  std::atomic<bool> is_closing{false};
+  HQUIC handle = nullptr;
   std::function<void()> on_connected;
   std::function<void(bool)> on_shutdown_complete;
   std::function<void(std::shared_ptr<Stream>)> on_peer_stream_started;
   std::vector<std::shared_ptr<Stream>> streams;
 };
+
+// Connection コールバック（前方宣言）
+QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event);
 
 class Connection {
  public:
@@ -328,22 +407,23 @@ class Connection {
     if (QUIC_FAILED(status)) {
       throw std::runtime_error("Failed to open connection");
     }
+    context_->handle = handle_;
   }
 
   // サーバー側から受け入れた接続用
   Connection(HQUIC handle) : handle_(handle), registration_(nullptr) {
     context_ = std::make_unique<ConnectionContext>();
-    g_MsQuic->SetContext(handle_, context_.get());
+    context_->handle = handle;
     g_MsQuic->SetCallbackHandler(handle_, (void*)ConnectionCallback, context_.get());
   }
 
   ~Connection() {
-    if (handle_ != nullptr && g_MsQuic != nullptr) {
-      g_MsQuic->ConnectionClose(handle_);
-    }
+    // SHUTDOWN_COMPLETE で Close されていない場合のフォールバック
+    // ただし、通常は SHUTDOWN_COMPLETE で Close される
   }
 
   HQUIC handle() const { return handle_; }
+  ConnectionContext* context() const { return context_.get(); }
 
   void start(Configuration& config, const std::string& server_name, uint16_t port) {
     QUIC_STATUS status = g_MsQuic->ConnectionStart(
@@ -381,20 +461,26 @@ class Connection {
     }
     auto stream = std::make_shared<Stream>(stream_handle);
     // コールバックのコンテキストを設定
-    g_MsQuic->SetCallbackHandler(stream_handle, (void*)StreamCallback, g_MsQuic->GetContext(stream_handle));
-    context_->streams.push_back(stream);
+    g_MsQuic->SetCallbackHandler(stream_handle, (void*)StreamCallback, stream->context());
+    {
+      std::lock_guard<std::mutex> lock(context_->mutex);
+      context_->streams.push_back(stream);
+    }
     return stream;
   }
 
   void set_on_connected(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_connected = std::move(callback);
   }
 
   void set_on_shutdown_complete(std::function<void(bool)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_shutdown_complete = std::move(callback);
   }
 
   void set_on_peer_stream_started(std::function<void(std::shared_ptr<Stream>)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_peer_stream_started = std::move(callback);
   }
 
@@ -402,36 +488,81 @@ class Connection {
   HQUIC handle_ = nullptr;
   Registration* registration_;
   std::unique_ptr<ConnectionContext> context_;
-
-  static QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event);
 };
 
-QUIC_STATUS QUIC_API Connection::ConnectionCallback(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event) {
+QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event) {
   auto* ctx = static_cast<ConnectionContext*>(context);
+  if (!ctx || ctx->is_closing.load()) {
+    return QUIC_STATUS_SUCCESS;
+  }
 
   switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED: {
-      if (ctx && ctx->on_connected) {
+      std::function<void()> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_connected;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_connected();
+        callback();
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
-      if (ctx && ctx->on_shutdown_complete) {
+      // コールバックを呼び出す
+      std::function<void(bool)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_shutdown_complete;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_shutdown_complete(event->SHUTDOWN_COMPLETE.AppCloseInProgress);
+        callback(event->SHUTDOWN_COMPLETE.AppCloseInProgress);
+      }
+      // 循環参照を解消するためにコールバックと streams をクリアする
+      {
+        nb::gil_scoped_acquire acquire;
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->on_connected = nullptr;
+        ctx->on_shutdown_complete = nullptr;
+        ctx->on_peer_stream_started = nullptr;
+        ctx->streams.clear();
+      }
+      // MsQuic のパターン: SHUTDOWN_COMPLETE で ConnectionClose を呼び出す
+      // AppCloseInProgress が true の場合、アプリが既に Close を呼んでいるのでスキップ
+      if (!event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
+        ctx->is_closing.store(true);
+        g_MsQuic->ConnectionClose(connection);
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
-      if (ctx && ctx->on_peer_stream_started) {
-        auto stream = std::make_shared<Stream>(event->PEER_STREAM_STARTED.Stream);
+      // Stream オブジェクトを作成
+      auto stream = std::make_shared<Stream>(event->PEER_STREAM_STARTED.Stream);
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
         ctx->streams.push_back(stream);
-        g_MsQuic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)StreamCallback, g_MsQuic->GetContext(stream->handle()));
-        nb::gil_scoped_acquire acquire;
-        ctx->on_peer_stream_started(stream);
       }
+
+      // 先に Python コールバックを呼んで on_receive を設定させる
+      // SetCallbackHandler の前に呼ばないと、RECEIVE イベントが来た時に
+      // on_receive が未設定でデータが失われる
+      std::function<void(std::shared_ptr<Stream>)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_peer_stream_started;
+      }
+      if (callback) {
+        nb::gil_scoped_acquire acquire;
+        callback(stream);
+      }
+
+      // Python が on_receive を設定した後にコールバックを有効化
+      g_MsQuic->SetCallbackHandler(
+          event->PEER_STREAM_STARTED.Stream,
+          (void*)StreamCallback,
+          stream->context());
       break;
     }
     default:
@@ -442,10 +573,16 @@ QUIC_STATUS QUIC_API Connection::ConnectionCallback(HQUIC connection, void* cont
 
 // ========== Listener ==========
 struct ListenerContext {
+  std::mutex mutex;
+  std::atomic<bool> is_closing{false};
+  HQUIC handle = nullptr;
   std::function<void(std::shared_ptr<Connection>)> on_new_connection;
-  Configuration* config;
+  Configuration* config = nullptr;
   std::vector<std::shared_ptr<Connection>> connections;
 };
+
+// Listener コールバック（前方宣言）
+QUIC_STATUS QUIC_API ListenerCallback(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event);
 
 class Listener {
  public:
@@ -459,12 +596,11 @@ class Listener {
     if (QUIC_FAILED(status)) {
       throw std::runtime_error("Failed to open listener");
     }
+    context_->handle = handle_;
   }
 
   ~Listener() {
-    if (handle_ != nullptr && g_MsQuic != nullptr) {
-      g_MsQuic->ListenerClose(handle_);
-    }
+    close();
   }
 
   void start(Configuration& config, const std::vector<std::string>& alpn_list, uint16_t port) {
@@ -494,10 +630,26 @@ class Listener {
   }
 
   void stop() {
-    g_MsQuic->ListenerStop(handle_);
+    if (handle_ != nullptr && g_MsQuic != nullptr) {
+      context_->is_closing.store(true);
+      // GIL を解放して MsQuic API を呼び出す
+      nb::gil_scoped_release release;
+      g_MsQuic->ListenerStop(handle_);
+    }
+  }
+
+  void close() {
+    if (handle_ != nullptr && g_MsQuic != nullptr) {
+      context_->is_closing.store(true);
+      // GIL を解放して MsQuic API を呼び出す
+      nb::gil_scoped_release release;
+      g_MsQuic->ListenerClose(handle_);
+      handle_ = nullptr;
+    }
   }
 
   void set_on_new_connection(std::function<void(std::shared_ptr<Connection>)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_new_connection = std::move(callback);
   }
 
@@ -505,17 +657,22 @@ class Listener {
   HQUIC handle_ = nullptr;
   std::unique_ptr<ListenerContext> context_;
   std::vector<QUIC_BUFFER> alpn_buffers_;
-
-  static QUIC_STATUS QUIC_API ListenerCallback(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event);
 };
 
-QUIC_STATUS QUIC_API Listener::ListenerCallback(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event) {
+QUIC_STATUS QUIC_API ListenerCallback(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event) {
   auto* ctx = static_cast<ListenerContext*>(context);
+  if (!ctx || ctx->is_closing.load()) {
+    return QUIC_STATUS_SUCCESS;
+  }
 
   switch (event->Type) {
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
+      // Connection オブジェクトを作成
       auto connection = std::make_shared<Connection>(event->NEW_CONNECTION.Connection);
-      ctx->connections.push_back(connection);
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->connections.push_back(connection);
+      }
 
       // Configuration を設定
       if (ctx->config) {
@@ -527,14 +684,27 @@ QUIC_STATUS QUIC_API Listener::ListenerCallback(HQUIC listener, void* context, Q
         }
       }
 
-      if (ctx->on_new_connection) {
+      std::function<void(std::shared_ptr<Connection>)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_new_connection;
+      }
+      if (callback) {
         nb::gil_scoped_acquire acquire;
-        ctx->on_new_connection(connection);
+        callback(connection);
       }
       break;
     }
-    case QUIC_LISTENER_EVENT_STOP_COMPLETE:
+    case QUIC_LISTENER_EVENT_STOP_COMPLETE: {
+      // 循環参照を解消するためにコールバックと connections をクリアする
+      {
+        nb::gil_scoped_acquire acquire;
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->on_new_connection = nullptr;
+        ctx->connections.clear();
+      }
       break;
+    }
     default:
       break;
   }
@@ -600,7 +770,8 @@ void bind_msquic(nb::module_& m) {
       .def(nb::init<const std::string&, QUIC_EXECUTION_PROFILE>(),
            "app_name"_a, "profile"_a = QUIC_EXECUTION_PROFILE_LOW_LATENCY)
       .def("shutdown", &Registration::shutdown,
-           "flags"_a = QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, "error_code"_a = 0);
+           "flags"_a = QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, "error_code"_a = 0)
+      .def("close", &Registration::close);
 
   // Configuration
   nb::class_<Configuration>(m, "Configuration")
@@ -610,7 +781,8 @@ void bind_msquic(nb::module_& m) {
       .def("load_credential_file", &Configuration::load_credential_file,
            "cert_file"_a, "key_file"_a, "is_client"_a = false)
       .def("load_credential_none", &Configuration::load_credential_none,
-           "no_certificate_validation"_a = false);
+           "no_certificate_validation"_a = false)
+      .def("close", &Configuration::close);
 
   // Stream
   nb::class_<Stream>(m, "Stream")
@@ -638,5 +810,6 @@ void bind_msquic(nb::module_& m) {
       .def(nb::init<Registration&>(), "registration"_a)
       .def("start", &Listener::start, "config"_a, "alpn_list"_a, "port"_a)
       .def("stop", &Listener::stop)
+      .def("close", &Listener::close)
       .def("set_on_new_connection", &Listener::set_on_new_connection);
 }
