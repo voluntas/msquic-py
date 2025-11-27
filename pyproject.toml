@@ -42,7 +42,7 @@ define = { "CMAKE_CXX_STANDARD" = "20" }
 verbose = false
 
 [tool.scikit-build.wheel]
-packages = ["src/msquic"]
+packages = ["src/msquic", "src/moqt"]
 expand-macos-universal-tags = true
 
 [tool.scikit-build.metadata.version]
