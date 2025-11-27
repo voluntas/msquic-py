@@ -183,11 +183,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/py.typed DESTINATION ${PY_PACKAGE})
 
 # 共有ライブラリをパッケージに含める
 if(APPLE)
-  install(FILES ${MSQUIC_LIB} DESTINATION ${PY_PACKAGE})
+  # macOS ではバージョン付き .dylib ファイルもコピー
+  file(GLOB MSQUIC_DYLIB_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic*.dylib")
+  install(FILES ${MSQUIC_DYLIB_FILES} DESTINATION ${PY_PACKAGE})
 elseif(UNIX)
   # Linux では .so ファイルをコピー
-  install(FILES ${MSQUIC_LIB} DESTINATION ${PY_PACKAGE})
-  # バージョン付きのsymlink対応
   file(GLOB MSQUIC_SO_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic.so*")
   install(FILES ${MSQUIC_SO_FILES} DESTINATION ${PY_PACKAGE})
 endif()

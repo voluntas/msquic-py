@@ -2,6 +2,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -19,7 +20,7 @@
 namespace nb = nanobind;
 using namespace nb::literals;
 
-namespace {
+namespace msquic_py {
 
 // グローバル API テーブル
 const QUIC_API_TABLE* g_MsQuic = nullptr;
@@ -44,6 +45,11 @@ void close_api() {
     g_MsQuic = nullptr;
   }
 }
+
+// 前方宣言
+class Stream;
+class Connection;
+QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
 
 // ========== Registration ==========
 class Registration {
@@ -172,9 +178,6 @@ class Configuration {
 };
 
 // ========== Stream ==========
-class Stream;
-class Connection;
-
 // Stream コールバック用のコンテキスト
 struct StreamContext {
   std::function<void(const std::vector<uint8_t>&, bool)> on_receive;
@@ -371,12 +374,14 @@ class Connection {
         handle_,
         flags,
         StreamCallback,
-        nullptr,  // Context は Stream オブジェクト作成後に設定
+        nullptr,
         &stream_handle);
     if (QUIC_FAILED(status)) {
       throw std::runtime_error("Failed to open stream");
     }
     auto stream = std::make_shared<Stream>(stream_handle);
+    // コールバックのコンテキストを設定
+    g_MsQuic->SetCallbackHandler(stream_handle, (void*)StreamCallback, g_MsQuic->GetContext(stream_handle));
     context_->streams.push_back(stream);
     return stream;
   }
@@ -423,7 +428,7 @@ QUIC_STATUS QUIC_API Connection::ConnectionCallback(HQUIC connection, void* cont
       if (ctx && ctx->on_peer_stream_started) {
         auto stream = std::make_shared<Stream>(event->PEER_STREAM_STARTED.Stream);
         ctx->streams.push_back(stream);
-        g_MsQuic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)StreamCallback, stream.get());
+        g_MsQuic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, (void*)StreamCallback, g_MsQuic->GetContext(stream->handle()));
         nb::gil_scoped_acquire acquire;
         ctx->on_peer_stream_started(stream);
       }
@@ -576,9 +581,11 @@ void bind_enums(nb::module_& m) {
       .value("DELAY_SEND", QUIC_SEND_FLAG_DELAY_SEND);
 }
 
-}  // namespace
+}  // namespace msquic_py
 
 void bind_msquic(nb::module_& m) {
+  using namespace msquic_py;
+
   m.doc() = "Python bindings for MsQuic";
 
   // ユーティリティ関数

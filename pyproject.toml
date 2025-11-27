@@ -12,14 +12,13 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: C++",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 
 [project.urls]
 Source = "https://github.com/shiguredo/msquic-py"
@@ -33,6 +32,9 @@ dev = [
 test = [
     "pytest",
     "pytest-timeout",
+    "pytest-asyncio",
+    "aioquic",
+    "cryptography",
 ]
 lint = ["ruff", "ty"]
 
