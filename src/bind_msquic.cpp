@@ -4,10 +4,33 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 // msquic
 #include <msquic.h>
+
+// quic_var_int.h を使用するために必要なマクロを定義
+#ifndef QUIC_INLINE
+#define QUIC_INLINE static inline
+#endif
+#ifndef CXPLAT_DBG_ASSERT
+#define CXPLAT_DBG_ASSERT(exp)
+#endif
+#ifndef CXPLAT_ANALYSIS_ASSERT
+#define CXPLAT_ANALYSIS_ASSERT(exp)
+#endif
+#ifndef CxPlatByteSwapUint16
+#define CxPlatByteSwapUint16(value) __builtin_bswap16((unsigned short)(value))
+#endif
+#ifndef CxPlatByteSwapUint32
+#define CxPlatByteSwapUint32(value) __builtin_bswap32((value))
+#endif
+#ifndef CxPlatByteSwapUint64
+#define CxPlatByteSwapUint64(value) __builtin_bswap64((value))
+#endif
+
+#include <quic_var_int.h>
 
 #include <atomic>
 #include <cstring>
@@ -751,6 +774,49 @@ void bind_enums(nb::module_& m) {
       .value("DELAY_SEND", QUIC_SEND_FLAG_DELAY_SEND);
 }
 
+// ========== Varint Functions ==========
+// QUIC Variable-Length Integer Encoding (RFC 9000 Section 16)
+// msquic の quic_var_int.h を使用
+
+nb::bytes encode_varint(uint64_t value) {
+  if (value > QUIC_VAR_INT_MAX) {
+    throw std::overflow_error("Value too large for varint encoding");
+  }
+
+  uint8_t buffer[8];
+  uint8_t* end = QuicVarIntEncode(value, buffer);
+  size_t size = static_cast<size_t>(end - buffer);
+
+  return nb::bytes(reinterpret_cast<char*>(buffer), size);
+}
+
+nb::tuple decode_varint(const nb::bytes& data, size_t offset = 0) {
+  size_t buffer_length = data.size();
+
+  if (offset >= buffer_length) {
+    throw std::out_of_range("Offset is out of range");
+  }
+
+  const uint8_t* buffer = reinterpret_cast<const uint8_t*>(data.c_str());
+  uint16_t pos = static_cast<uint16_t>(offset);
+  QUIC_VAR_INT value;
+
+  if (!QuicVarIntDecode(static_cast<uint16_t>(buffer_length), buffer, &pos,
+                        &value)) {
+    throw std::runtime_error("Insufficient data for varint decoding");
+  }
+
+  size_t consumed = static_cast<size_t>(pos - offset);
+  return nb::make_tuple(value, consumed);
+}
+
+uint8_t varint_size(uint64_t value) {
+  if (value > QUIC_VAR_INT_MAX) {
+    throw std::overflow_error("Value too large for varint encoding");
+  }
+  return static_cast<uint8_t>(QuicVarIntSize(value));
+}
+
 }  // namespace msquic_py
 
 void bind_msquic(nb::module_& m) {
@@ -761,6 +827,14 @@ void bind_msquic(nb::module_& m) {
   // ユーティリティ関数
   m.def("open_api", &open_api, "Open the MsQuic API");
   m.def("close_api", &close_api, "Close the MsQuic API");
+
+  // Varint 関数
+  m.def("encode_varint", &encode_varint, "value"_a,
+        "Encode an integer as a QUIC variable-length integer");
+  m.def("decode_varint", &decode_varint, "data"_a, "offset"_a = 0,
+        "Decode a QUIC variable-length integer, returns (value, consumed_bytes)");
+  m.def("varint_size", &varint_size, "value"_a,
+        "Get the number of bytes required to encode a value as varint");
 
   // Enums
   bind_enums(m);
