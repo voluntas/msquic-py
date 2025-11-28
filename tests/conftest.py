@@ -20,7 +20,7 @@ def sample_alpn():
     return ["h3"]
 
 
-def get_free_port():
+def get_free_port() -> int:
     """空いているポートを取得"""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.bind(("127.0.0.1", 0))

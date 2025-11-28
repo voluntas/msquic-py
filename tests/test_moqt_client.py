@@ -4,7 +4,6 @@ msquic-py の MOQT クライアントから aioquic の MOQT サーバーへ接�
 """
 
 import asyncio
-import socket
 import threading
 
 import pytest
@@ -23,12 +22,7 @@ from moqt import (
     encode_varint,
 )
 
-
-def get_free_port():
-    """空いているポートを取得"""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from conftest import get_free_port
 
 
 class MoqtServerProtocol(QuicConnectionProtocol):

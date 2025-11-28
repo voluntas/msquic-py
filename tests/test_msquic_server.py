@@ -4,7 +4,6 @@ msquic で起動した QUIC サーバーに aioquic クライアントから接�
 """
 
 import asyncio
-import socket
 
 import pytest
 from aioquic.asyncio import connect
@@ -14,12 +13,7 @@ from aioquic.quic.events import HandshakeCompleted, StreamDataReceived
 
 import msquic
 
-
-def get_free_port():
-    """空いているポートを取得"""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from conftest import get_free_port
 
 
 def create_echo_client_protocol(*args, **kwargs):
