@@ -25,7 +25,11 @@ Source = "https://github.com/shiguredo/msquic-py"
 Discord = "https://discord.gg/shiguredo"
 
 [dependency-groups]
-dev = [{ include-group = "test" }, { include-group = "lint" }]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+    "pytest-repeat>=0.9.4",
+]
 test = ["pytest", "pytest-timeout", "pytest-asyncio", "aioquic", "cryptography"]
 lint = ["ruff", "ty"]
 example = ["webcodecs-py", "mp4-py", "opencv-python", "numpy"]

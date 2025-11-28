@@ -224,8 +224,10 @@ class Configuration {
 
 // ========== Stream ==========
 // Stream コールバック用のコンテキスト
+// 注意: mutex は使用しない。すべてのコールバック操作は GIL で保護される。
+// Python から呼ばれる set_on_* は GIL 保持中、
+// MsQuic からのコールバックは GIL を取得してからアクセスする。
 struct StreamContext {
-  std::mutex mutex;
   std::atomic<bool> is_closing{false};
   HQUIC handle = nullptr;
   std::function<void(const std::vector<uint8_t>&, bool)> on_receive;
@@ -290,17 +292,17 @@ class Stream {
   }
 
   void set_on_receive(std::function<void(const std::vector<uint8_t>&, bool)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_receive = std::move(callback);
   }
 
   void set_on_send_complete(std::function<void()> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_send_complete = std::move(callback);
   }
 
   void set_on_shutdown_complete(std::function<void(bool)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_shutdown_complete = std::move(callback);
   }
 
@@ -318,20 +320,18 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
 
   switch (event->Type) {
     case QUIC_STREAM_EVENT_RECEIVE: {
-      std::function<void(const std::vector<uint8_t>&, bool)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_receive;
+      // データを先にコピー (GIL 不要)
+      std::vector<uint8_t> data;
+      for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
+        const auto& buf = event->RECEIVE.Buffers[i];
+        data.insert(data.end(), buf.Buffer, buf.Buffer + buf.Length);
       }
-      if (callback) {
-        std::vector<uint8_t> data;
-        for (uint32_t i = 0; i < event->RECEIVE.BufferCount; i++) {
-          const auto& buf = event->RECEIVE.Buffers[i];
-          data.insert(data.end(), buf.Buffer, buf.Buffer + buf.Length);
-        }
-        bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
-        nb::gil_scoped_acquire acquire;
-        callback(data, fin);
+      bool fin = (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_receive) {
+        ctx->on_receive(data, fin);
       }
       break;
     }
@@ -342,56 +342,42 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
         delete[] buffer->Buffer;
         delete buffer;
       }
-      std::function<void()> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_send_complete;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback();
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_send_complete) {
+        ctx->on_send_complete();
       }
       break;
     }
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED: {
-      std::function<void(uint64_t)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_peer_send_aborted;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->PEER_SEND_ABORTED.ErrorCode);
+      uint64_t error_code = event->PEER_SEND_ABORTED.ErrorCode;
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_peer_send_aborted) {
+        ctx->on_peer_send_aborted(error_code);
       }
       break;
     }
     case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED: {
-      std::function<void(uint64_t)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_peer_receive_aborted;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->PEER_RECEIVE_ABORTED.ErrorCode);
+      uint64_t error_code = event->PEER_RECEIVE_ABORTED.ErrorCode;
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_peer_receive_aborted) {
+        ctx->on_peer_receive_aborted(error_code);
       }
       break;
     }
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
-      // コールバックを呼び出す
-      std::function<void(bool)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_shutdown_complete;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->SHUTDOWN_COMPLETE.ConnectionShutdown);
-      }
-      // 循環参照を解消するためにコールバックをクリアする
+      // 先に is_closing をセットして、これ以降のコールバックをブロック
+      ctx->is_closing.store(true);
+
+      // GIL を取得してコールバックを呼び出し、その後クリア
       {
         nb::gil_scoped_acquire acquire;
-        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->on_shutdown_complete) {
+          ctx->on_shutdown_complete(event->SHUTDOWN_COMPLETE.ConnectionShutdown);
+        }
+        // 循環参照を解消するためにコールバックをクリアする
         ctx->on_receive = nullptr;
         ctx->on_send_complete = nullptr;
         ctx->on_peer_send_aborted = nullptr;
@@ -401,7 +387,6 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
       // MsQuic のパターン: SHUTDOWN_COMPLETE で StreamClose を呼び出す
       // AppCloseInProgress が true の場合、アプリが既に Close を呼んでいるのでスキップ
       if (!event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
-        ctx->is_closing.store(true);
         g_MsQuic->StreamClose(stream);
       }
       break;
@@ -413,8 +398,8 @@ QUIC_STATUS QUIC_API StreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVE
 }
 
 // ========== Connection ==========
+// 注意: mutex は使用しない。すべてのコールバック操作は GIL で保護される。
 struct ConnectionContext {
-  std::mutex mutex;
   std::atomic<bool> is_closing{false};
   HQUIC handle = nullptr;
   std::function<void(bool)> on_connected;
@@ -500,25 +485,23 @@ class Connection {
     auto stream = std::make_shared<Stream>(stream_handle);
     // コールバックのコンテキストを設定
     g_MsQuic->SetCallbackHandler(stream_handle, (void*)StreamCallback, stream->context());
-    {
-      std::lock_guard<std::mutex> lock(context_->mutex);
-      context_->streams.push_back(stream);
-    }
+    // GIL 保持中に呼ばれる (Python から)
+    context_->streams.push_back(stream);
     return stream;
   }
 
   void set_on_connected(std::function<void(bool)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_connected = std::move(callback);
   }
 
   void set_on_shutdown_complete(std::function<void(bool)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_shutdown_complete = std::move(callback);
   }
 
   void set_on_peer_stream_started(std::function<void(std::shared_ptr<Stream>)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_peer_stream_started = std::move(callback);
   }
 
@@ -544,17 +527,17 @@ class Connection {
   }
 
   void set_on_datagram_state_changed(std::function<void(bool, uint16_t)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_datagram_state_changed = std::move(callback);
   }
 
   void set_on_datagram_received(std::function<void(const std::vector<uint8_t>&)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_datagram_received = std::move(callback);
   }
 
   void set_on_datagram_send_state_changed(std::function<void(QUIC_DATAGRAM_SEND_STATE)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_datagram_send_state_changed = std::move(callback);
   }
 
@@ -572,23 +555,32 @@ class Connection {
 
   // Resumption メソッド (クライアント側)
   void set_resumption_ticket(const nb::bytes& ticket) {
-    QUIC_STATUS status = g_MsQuic->SetParam(
-        handle_,
-        QUIC_PARAM_CONN_RESUMPTION_TICKET,
-        static_cast<uint32_t>(ticket.size()),
-        ticket.c_str());
+    // データを先にコピーしておく
+    std::vector<uint8_t> ticket_data(ticket.c_str(), ticket.c_str() + ticket.size());
+    QUIC_STATUS status;
+    {
+      // GIL を解放して MsQuic API を呼び出す
+      // MsQuic は内部で他のスレッドと同期する可能性があり、
+      // そのスレッドが GIL を待っているとデッドロックになる
+      nb::gil_scoped_release release;
+      status = g_MsQuic->SetParam(
+          handle_,
+          QUIC_PARAM_CONN_RESUMPTION_TICKET,
+          static_cast<uint32_t>(ticket_data.size()),
+          ticket_data.data());
+    }
     if (QUIC_FAILED(status)) {
       throw std::runtime_error("Failed to set resumption ticket");
     }
   }
 
   void set_on_resumption_ticket_received(std::function<void(const std::vector<uint8_t>&)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_resumption_ticket_received = std::move(callback);
   }
 
   void set_on_resumed(std::function<void(const std::vector<uint8_t>&)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_resumed = std::move(callback);
   }
 
@@ -606,32 +598,25 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
 
   switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED: {
-      std::function<void(bool)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_connected;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->CONNECTED.SessionResumed != 0);
+      bool session_resumed = event->CONNECTED.SessionResumed != 0;
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_connected) {
+        ctx->on_connected(session_resumed);
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
-      // コールバックを呼び出す
-      std::function<void(bool)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_shutdown_complete;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->SHUTDOWN_COMPLETE.AppCloseInProgress);
-      }
-      // 循環参照を解消するためにコールバックと streams をクリアする
+      // 先に is_closing をセットして、これ以降のコールバックをブロック
+      ctx->is_closing.store(true);
+
+      // GIL を取得してコールバックを呼び出し、その後クリア
       {
         nb::gil_scoped_acquire acquire;
-        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->on_shutdown_complete) {
+          ctx->on_shutdown_complete(event->SHUTDOWN_COMPLETE.AppCloseInProgress);
+        }
+        // 循環参照を解消するためにコールバックと streams をクリアする
         ctx->on_connected = nullptr;
         ctx->on_shutdown_complete = nullptr;
         ctx->on_peer_stream_started = nullptr;
@@ -645,7 +630,6 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
       // MsQuic のパターン: SHUTDOWN_COMPLETE で ConnectionClose を呼び出す
       // AppCloseInProgress が true の場合、アプリが既に Close を呼んでいるのでスキップ
       if (!event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
-        ctx->is_closing.store(true);
         g_MsQuic->ConnectionClose(connection);
       }
       break;
@@ -653,22 +637,17 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
       // Stream オブジェクトを作成
       auto stream = std::make_shared<Stream>(event->PEER_STREAM_STARTED.Stream);
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        ctx->streams.push_back(stream);
-      }
 
+      // GIL を取得してコールバックにアクセス
       // 先に Python コールバックを呼んで on_receive を設定させる
       // SetCallbackHandler の前に呼ばないと、RECEIVE イベントが来た時に
       // on_receive が未設定でデータが失われる
-      std::function<void(std::shared_ptr<Stream>)> callback;
       {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_peer_stream_started;
-      }
-      if (callback) {
         nb::gil_scoped_acquire acquire;
-        callback(stream);
+        ctx->streams.push_back(stream);
+        if (ctx->on_peer_stream_started) {
+          ctx->on_peer_stream_started(stream);
+        }
       }
 
       // Python が on_receive を設定した後にコールバックを有効化
@@ -679,46 +658,40 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
       break;
     }
     case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED: {
-      std::function<void(bool, uint16_t)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_datagram_state_changed;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(event->DATAGRAM_STATE_CHANGED.SendEnabled != 0,
-                 event->DATAGRAM_STATE_CHANGED.MaxSendLength);
+      bool send_enabled = event->DATAGRAM_STATE_CHANGED.SendEnabled != 0;
+      uint16_t max_send_length = event->DATAGRAM_STATE_CHANGED.MaxSendLength;
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_datagram_state_changed) {
+        ctx->on_datagram_state_changed(send_enabled, max_send_length);
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED: {
-      std::function<void(const std::vector<uint8_t>&)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_datagram_received;
-      }
-      if (callback) {
-        std::vector<uint8_t> data(
-            event->DATAGRAM_RECEIVED.Buffer->Buffer,
-            event->DATAGRAM_RECEIVED.Buffer->Buffer + event->DATAGRAM_RECEIVED.Buffer->Length);
-        nb::gil_scoped_acquire acquire;
-        callback(data);
+      // データを先にコピー (GIL 不要)
+      std::vector<uint8_t> data(
+          event->DATAGRAM_RECEIVED.Buffer->Buffer,
+          event->DATAGRAM_RECEIVED.Buffer->Buffer + event->DATAGRAM_RECEIVED.Buffer->Length);
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_datagram_received) {
+        ctx->on_datagram_received(data);
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
-      std::function<void(QUIC_DATAGRAM_SEND_STATE)> callback;
+      QUIC_DATAGRAM_SEND_STATE state = event->DATAGRAM_SEND_STATE_CHANGED.State;
+      void* client_context = event->DATAGRAM_SEND_STATE_CHANGED.ClientContext;
+      // GIL を取得してコールバックにアクセス
       {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_datagram_send_state_changed;
-      }
-      if (callback) {
         nb::gil_scoped_acquire acquire;
-        callback(event->DATAGRAM_SEND_STATE_CHANGED.State);
+        if (ctx->on_datagram_send_state_changed) {
+          ctx->on_datagram_send_state_changed(state);
+        }
       }
       // 送信バッファを解放（最終状態の場合）
-      if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(event->DATAGRAM_SEND_STATE_CHANGED.State)) {
-        auto* buffer = static_cast<QUIC_BUFFER*>(event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+      if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(state)) {
+        auto* buffer = static_cast<QUIC_BUFFER*>(client_context);
         if (buffer) {
           delete[] buffer->Buffer;
           delete buffer;
@@ -727,33 +700,27 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
       break;
     }
     case QUIC_CONNECTION_EVENT_RESUMPTION_TICKET_RECEIVED: {
-      std::function<void(const std::vector<uint8_t>&)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_resumption_ticket_received;
-      }
-      if (callback) {
-        std::vector<uint8_t> ticket(
-            event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket,
-            event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket +
-                event->RESUMPTION_TICKET_RECEIVED.ResumptionTicketLength);
-        nb::gil_scoped_acquire acquire;
-        callback(ticket);
+      // データを先にコピー (GIL 不要)
+      std::vector<uint8_t> ticket(
+          event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket,
+          event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket +
+              event->RESUMPTION_TICKET_RECEIVED.ResumptionTicketLength);
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_resumption_ticket_received) {
+        ctx->on_resumption_ticket_received(ticket);
       }
       break;
     }
     case QUIC_CONNECTION_EVENT_RESUMED: {
-      std::function<void(const std::vector<uint8_t>&)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_resumed;
-      }
-      if (callback) {
-        std::vector<uint8_t> state(
-            event->RESUMED.ResumptionState,
-            event->RESUMED.ResumptionState + event->RESUMED.ResumptionStateLength);
-        nb::gil_scoped_acquire acquire;
-        callback(state);
+      // データを先にコピー (GIL 不要)
+      std::vector<uint8_t> resumption_state(
+          event->RESUMED.ResumptionState,
+          event->RESUMED.ResumptionState + event->RESUMED.ResumptionStateLength);
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      if (ctx->on_resumed) {
+        ctx->on_resumed(resumption_state);
       }
       break;
     }
@@ -764,8 +731,8 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
 }
 
 // ========== Listener ==========
+// 注意: mutex は使用しない。すべてのコールバック操作は GIL で保護される。
 struct ListenerContext {
-  std::mutex mutex;
   std::atomic<bool> is_closing{false};
   HQUIC handle = nullptr;
   std::function<void(std::shared_ptr<Connection>)> on_new_connection;
@@ -841,7 +808,7 @@ class Listener {
   }
 
   void set_on_new_connection(std::function<void(std::shared_ptr<Connection>)> callback) {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+    // GIL 保持中に呼ばれる (Python から)
     context_->on_new_connection = std::move(callback);
   }
 
@@ -861,10 +828,6 @@ QUIC_STATUS QUIC_API ListenerCallback(HQUIC listener, void* context, QUIC_LISTEN
     case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
       // Connection オブジェクトを作成
       auto connection = std::make_shared<Connection>(event->NEW_CONNECTION.Connection);
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        ctx->connections.push_back(connection);
-      }
 
       // Configuration を設定
       if (ctx->config) {
@@ -876,25 +839,21 @@ QUIC_STATUS QUIC_API ListenerCallback(HQUIC listener, void* context, QUIC_LISTEN
         }
       }
 
-      std::function<void(std::shared_ptr<Connection>)> callback;
-      {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        callback = ctx->on_new_connection;
-      }
-      if (callback) {
-        nb::gil_scoped_acquire acquire;
-        callback(connection);
+      // GIL を取得してコールバックにアクセス
+      nb::gil_scoped_acquire acquire;
+      ctx->connections.push_back(connection);
+      if (ctx->on_new_connection) {
+        ctx->on_new_connection(connection);
       }
       break;
     }
     case QUIC_LISTENER_EVENT_STOP_COMPLETE: {
-      // 循環参照を解消するためにコールバックと connections をクリアする
-      {
-        nb::gil_scoped_acquire acquire;
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        ctx->on_new_connection = nullptr;
-        ctx->connections.clear();
-      }
+      // 先に is_closing をセット
+      ctx->is_closing.store(true);
+      // GIL を取得してコールバックと connections をクリア
+      nb::gil_scoped_acquire acquire;
+      ctx->on_new_connection = nullptr;
+      ctx->connections.clear();
       break;
     }
     default:
