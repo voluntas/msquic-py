@@ -5,11 +5,42 @@ draft-ietf-moq-transport-15 Section 9 に基づく実装
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import ClassVar
 
 from .varint import decode_varint, encode_varint
+
+
+class ErrorCode(IntEnum):
+    """MOQT Error Codes (Section 8.2)"""
+
+    NO_ERROR = 0x0
+    INTERNAL_ERROR = 0x1
+    UNAUTHORIZED = 0x2
+    PROTOCOL_VIOLATION = 0x3
+    DUPLICATE_TRACK_ALIAS = 0x4
+    PARAMETER_LENGTH_MISMATCH = 0x5
+    TOO_MANY_SUBSCRIBERS = 0x6
+    GOAWAY_TIMEOUT = 0x10
+
+
+class TrackStatusCode(IntEnum):
+    """Track Status Codes (Section 9.7.1)"""
+
+    IN_PROGRESS = 0x0
+    TRACK_DOES_NOT_EXIST = 0x1
+    NO_OBJECTS = 0x2
+    GROUP_DOES_NOT_EXIST = 0x3
+
+
+class StreamType(IntEnum):
+    """MOQT Stream Types (Section 10.1)"""
+
+    CONTROL = 0x00
+    SUBGROUP = 0x04
+    FETCH = 0x05
 
 
 class MessageType(IntEnum):
@@ -398,7 +429,7 @@ class TrackNamespace:
         return result
 
     @classmethod
-    def decode(cls, data: bytes, offset: int = 0) -> tuple[TrackNamespace, int]:
+    def decode(cls, data: bytes, offset: int = 0) -> builtins.tuple[TrackNamespace, int]:
         num_elements, consumed = decode_varint(data, offset)
         total_consumed = consumed
         elements = []

@@ -28,6 +28,7 @@ Discord = "https://discord.gg/shiguredo"
 dev = [{ include-group = "test" }, { include-group = "lint" }]
 test = ["pytest", "pytest-timeout", "pytest-asyncio", "aioquic", "cryptography"]
 lint = ["ruff", "ty"]
+example = ["webcodecs-py", "mp4-py", "opencv-python", "numpy"]
 
 [tool.scikit-build]
 minimum-version = "0.11"

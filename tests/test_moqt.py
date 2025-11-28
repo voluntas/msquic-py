@@ -21,7 +21,31 @@ from moqt.message import (
     ParameterType,
     TrackNamespace,
     Location,
+    ErrorCode,
+    TrackStatusCode,
+    StreamType,
+    FilterType,
+    GroupOrder,
+    Fetch,
+    FetchOk,
+    FetchCancel,
+    TrackStatus,
+    PublishNamespace,
+    PublishNamespaceDone,
+    PublishNamespaceCancel,
+    SubscribeNamespace,
+    UnsubscribeNamespace,
+    SubscribeUpdate,
     decode_control_message,
+)
+from moqt.session import (
+    MoqtSession,
+    SessionState,
+    Role,
+    SubscriptionFilter,
+    TrackInfo,
+    SUPPORTED_VERSIONS,
+    CURRENT_VERSION,
 )
 
 
@@ -297,3 +321,336 @@ class TestPublishDone:
         assert decoded.request_id == 30
         assert decoded.status_code == 0
         assert decoded.reason_phrase == "Completed"
+
+
+class TestErrorCode:
+    """ErrorCode のテスト"""
+
+    def test_error_code_values(self):
+        """エラーコードの値を確認"""
+        assert ErrorCode.NO_ERROR == 0x0
+        assert ErrorCode.INTERNAL_ERROR == 0x1
+        assert ErrorCode.UNAUTHORIZED == 0x2
+        assert ErrorCode.PROTOCOL_VIOLATION == 0x3
+        assert ErrorCode.DUPLICATE_TRACK_ALIAS == 0x4
+        assert ErrorCode.PARAMETER_LENGTH_MISMATCH == 0x5
+        assert ErrorCode.TOO_MANY_SUBSCRIBERS == 0x6
+        assert ErrorCode.GOAWAY_TIMEOUT == 0x10
+
+
+class TestTrackStatusCode:
+    """TrackStatusCode のテスト"""
+
+    def test_status_code_values(self):
+        """ステータスコードの値を確認"""
+        assert TrackStatusCode.IN_PROGRESS == 0x0
+        assert TrackStatusCode.TRACK_DOES_NOT_EXIST == 0x1
+        assert TrackStatusCode.NO_OBJECTS == 0x2
+        assert TrackStatusCode.GROUP_DOES_NOT_EXIST == 0x3
+
+
+class TestStreamType:
+    """StreamType のテスト"""
+
+    def test_stream_type_values(self):
+        """ストリームタイプの値を確認"""
+        assert StreamType.CONTROL == 0x00
+        assert StreamType.SUBGROUP == 0x04
+        assert StreamType.FETCH == 0x05
+
+
+class TestSubscriptionFilter:
+    """SubscriptionFilter のテスト"""
+
+    def test_latest_group(self):
+        """LATEST_GROUP フィルターのエンコード/デコード"""
+        filter_obj = SubscriptionFilter(filter_type=FilterType.LATEST_GROUP)
+        encoded = filter_obj.encode()
+        decoded, consumed = SubscriptionFilter.decode(encoded)
+        assert decoded.filter_type == FilterType.LATEST_GROUP
+        assert decoded.start_group is None
+
+    def test_latest_object(self):
+        """LATEST_OBJECT フィルターのエンコード/デコード"""
+        filter_obj = SubscriptionFilter(filter_type=FilterType.LATEST_OBJECT)
+        encoded = filter_obj.encode()
+        decoded, consumed = SubscriptionFilter.decode(encoded)
+        assert decoded.filter_type == FilterType.LATEST_OBJECT
+
+    def test_absolute_start(self):
+        """ABSOLUTE_START フィルターのエンコード/デコード"""
+        filter_obj = SubscriptionFilter(
+            filter_type=FilterType.ABSOLUTE_START,
+            start_group=10,
+            start_object=5,
+        )
+        encoded = filter_obj.encode()
+        decoded, consumed = SubscriptionFilter.decode(encoded)
+        assert decoded.filter_type == FilterType.ABSOLUTE_START
+        assert decoded.start_group == 10
+        assert decoded.start_object == 5
+
+    def test_absolute_range(self):
+        """ABSOLUTE_RANGE フィルターのエンコード/デコード"""
+        filter_obj = SubscriptionFilter(
+            filter_type=FilterType.ABSOLUTE_RANGE,
+            start_group=10,
+            start_object=5,
+            end_group=20,
+            end_object=15,
+        )
+        encoded = filter_obj.encode()
+        decoded, consumed = SubscriptionFilter.decode(encoded)
+        assert decoded.filter_type == FilterType.ABSOLUTE_RANGE
+        assert decoded.start_group == 10
+        assert decoded.start_object == 5
+        assert decoded.end_group == 20
+        assert decoded.end_object == 15
+
+    def test_absolute_start_missing_fields(self):
+        """ABSOLUTE_START で必須フィールドがない場合のエラー"""
+        filter_obj = SubscriptionFilter(filter_type=FilterType.ABSOLUTE_START)
+        with pytest.raises(ValueError):
+            filter_obj.encode()
+
+    def test_absolute_range_missing_fields(self):
+        """ABSOLUTE_RANGE で必須フィールドがない場合のエラー"""
+        filter_obj = SubscriptionFilter(
+            filter_type=FilterType.ABSOLUTE_RANGE,
+            start_group=10,
+            start_object=5,
+        )
+        with pytest.raises(ValueError):
+            filter_obj.encode()
+
+
+class TestFetch:
+    """FETCH メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = Fetch(
+            request_id=100,
+            track_namespace=TrackNamespace(tuple=[b"media", b"video"]),
+            track_name=b"stream1",
+            start=Location(group=0, object=0),
+            end=Location(group=10, object=100),
+        )
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, Fetch)
+        assert decoded.request_id == 100
+        assert decoded.track_namespace.tuple == [b"media", b"video"]
+        assert decoded.track_name == b"stream1"
+        assert decoded.start.group == 0
+        assert decoded.start.object == 0
+        assert decoded.end.group == 10
+        assert decoded.end.object == 100
+
+
+class TestFetchOk:
+    """FETCH_OK メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = FetchOk(request_id=100)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, FetchOk)
+        assert decoded.request_id == 100
+
+
+class TestFetchCancel:
+    """FETCH_CANCEL メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = FetchCancel(request_id=100)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, FetchCancel)
+        assert decoded.request_id == 100
+
+
+class TestTrackStatusMessage:
+    """TRACK_STATUS メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = TrackStatus(
+            request_id=50,
+            track_namespace=TrackNamespace(tuple=[b"live"]),
+            track_name=b"video",
+        )
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, TrackStatus)
+        assert decoded.request_id == 50
+        assert decoded.track_namespace.tuple == [b"live"]
+        assert decoded.track_name == b"video"
+
+
+class TestPublishNamespace:
+    """PUBLISH_NAMESPACE メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = PublishNamespace(
+            request_id=60,
+            track_namespace=TrackNamespace(tuple=[b"media", b"streams"]),
+        )
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, PublishNamespace)
+        assert decoded.request_id == 60
+        assert decoded.track_namespace.tuple == [b"media", b"streams"]
+
+
+class TestPublishNamespaceDone:
+    """PUBLISH_NAMESPACE_DONE メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = PublishNamespaceDone(
+            request_id=60,
+            status_code=0,
+            reason_phrase="Done",
+        )
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, PublishNamespaceDone)
+        assert decoded.request_id == 60
+        assert decoded.status_code == 0
+        assert decoded.reason_phrase == "Done"
+
+
+class TestPublishNamespaceCancel:
+    """PUBLISH_NAMESPACE_CANCEL メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = PublishNamespaceCancel(request_id=60)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, PublishNamespaceCancel)
+        assert decoded.request_id == 60
+
+
+class TestSubscribeNamespace:
+    """SUBSCRIBE_NAMESPACE メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = SubscribeNamespace(
+            request_id=70,
+            track_namespace_prefix=TrackNamespace(tuple=[b"media"]),
+        )
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, SubscribeNamespace)
+        assert decoded.request_id == 70
+        assert decoded.track_namespace_prefix.tuple == [b"media"]
+
+
+class TestUnsubscribeNamespace:
+    """UNSUBSCRIBE_NAMESPACE メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = UnsubscribeNamespace(request_id=70)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, UnsubscribeNamespace)
+        assert decoded.request_id == 70
+
+
+class TestSubscribeUpdate:
+    """SUBSCRIBE_UPDATE メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = SubscribeUpdate(request_id=80)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, SubscribeUpdate)
+        assert decoded.request_id == 80
+
+
+class TestRequestsBlocked:
+    """REQUESTS_BLOCKED メッセージのテスト"""
+
+    def test_encode_decode(self):
+        """エンコード/デコード"""
+        msg = RequestsBlocked(maximum_request_id=999)
+        encoded = msg.encode()
+        decoded, consumed = decode_control_message(encoded)
+        assert isinstance(decoded, RequestsBlocked)
+        assert decoded.maximum_request_id == 999
+
+
+class TestMoqtSession:
+    """MoqtSession のテスト"""
+
+    def test_client_session_init(self):
+        """クライアントセッションの初期化"""
+        session = MoqtSession(role=Role.CLIENT)
+        assert session.role == Role.CLIENT
+        assert session.state == SessionState.IDLE
+        assert session.next_request_id == 0
+
+    def test_server_session_init(self):
+        """サーバーセッションの初期化"""
+        session = MoqtSession(role=Role.SERVER)
+        assert session.role == Role.SERVER
+        assert session.state == SessionState.IDLE
+        assert session.next_request_id == 1
+
+    def test_allocate_request_id_client(self):
+        """クライアントの Request ID 割り当て"""
+        session = MoqtSession(role=Role.CLIENT)
+        session.peer_max_request_id = 100
+        assert session.allocate_request_id() == 0
+        assert session.allocate_request_id() == 2
+        assert session.allocate_request_id() == 4
+
+    def test_allocate_request_id_server(self):
+        """サーバーの Request ID 割り当て"""
+        session = MoqtSession(role=Role.SERVER)
+        session.peer_max_request_id = 101
+        assert session.allocate_request_id() == 1
+        assert session.allocate_request_id() == 3
+        assert session.allocate_request_id() == 5
+
+    def test_allocate_track_alias(self):
+        """Track Alias の割り当て"""
+        session = MoqtSession(role=Role.CLIENT)
+        assert session.allocate_track_alias() == 0
+        assert session.allocate_track_alias() == 1
+        assert session.allocate_track_alias() == 2
+
+    def test_version_constants(self):
+        """バージョン定数の確認"""
+        assert CURRENT_VERSION == 0xFF000015
+        assert 0xFF000015 in SUPPORTED_VERSIONS
+
+    def test_track_info(self):
+        """TrackInfo の作成"""
+        info = TrackInfo(
+            request_id=10,
+            track_alias=1,
+            track_namespace=TrackNamespace(tuple=[b"media"]),
+            track_name=b"video",
+        )
+        assert info.request_id == 10
+        assert info.track_alias == 1
+        assert info.subscription_filter is None
+        assert info.group_order is None
+
+
+class TestGroupOrder:
+    """GroupOrder のテスト"""
+
+    def test_group_order_values(self):
+        """グループ順序の値を確認"""
+        assert GroupOrder.ASCENDING == 0x01
+        assert GroupOrder.DESCENDING == 0x02
