@@ -28,7 +28,7 @@ def test_connect_to_server(quic_server):
     # Connection 作成
     conn = msquic.Connection(reg)
 
-    def on_connected():
+    def on_connected(_session_resumed):
         connected_event.set()
 
     def on_shutdown_complete(_app_close_in_progress):
@@ -69,7 +69,7 @@ def test_echo_stream(quic_server):
     # Connection 作成
     conn = msquic.Connection(reg)
 
-    def on_connected():
+    def on_connected(_session_resumed):
         connected_event.set()
 
     def on_shutdown_complete(_app_close_in_progress):
@@ -135,7 +135,7 @@ def test_multiple_streams(quic_server):
     # Connection 作成
     conn = msquic.Connection(reg)
 
-    def on_connected():
+    def on_connected(_session_resumed):
         connected_event.set()
 
     def on_shutdown_complete(_app_close_in_progress):

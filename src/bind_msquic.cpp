@@ -120,7 +120,9 @@ class Configuration {
                 const std::vector<std::string>& alpn_list,
                 uint64_t idle_timeout_ms = 0,
                 uint16_t peer_bidi_stream_count = 0,
-                uint16_t peer_unidi_stream_count = 0) {
+                uint16_t peer_unidi_stream_count = 0,
+                bool datagram_receive_enabled = false,
+                QUIC_SERVER_RESUMPTION_LEVEL server_resumption_level = QUIC_SERVER_NO_RESUME) {
     // ALPN バッファを構築
     std::vector<QUIC_BUFFER> alpn_buffers;
     for (const auto& alpn : alpn_list) {
@@ -144,6 +146,12 @@ class Configuration {
       settings.PeerUnidiStreamCount = peer_unidi_stream_count;
       settings.IsSet.PeerUnidiStreamCount = TRUE;
     }
+    // DATAGRAM 受信を有効化
+    settings.DatagramReceiveEnabled = datagram_receive_enabled ? TRUE : FALSE;
+    settings.IsSet.DatagramReceiveEnabled = TRUE;
+    // サーバー側の Resumption レベルを設定
+    settings.ServerResumptionLevel = server_resumption_level;
+    settings.IsSet.ServerResumptionLevel = TRUE;
 
     QUIC_STATUS status = g_MsQuic->ConfigurationOpen(
         registration.handle(),
@@ -409,10 +417,17 @@ struct ConnectionContext {
   std::mutex mutex;
   std::atomic<bool> is_closing{false};
   HQUIC handle = nullptr;
-  std::function<void()> on_connected;
+  std::function<void(bool)> on_connected;
   std::function<void(bool)> on_shutdown_complete;
   std::function<void(std::shared_ptr<Stream>)> on_peer_stream_started;
   std::vector<std::shared_ptr<Stream>> streams;
+  // DATAGRAM コールバック
+  std::function<void(bool, uint16_t)> on_datagram_state_changed;
+  std::function<void(const std::vector<uint8_t>&)> on_datagram_received;
+  std::function<void(QUIC_DATAGRAM_SEND_STATE)> on_datagram_send_state_changed;
+  // Resumption コールバック
+  std::function<void(const std::vector<uint8_t>&)> on_resumption_ticket_received;
+  std::function<void(const std::vector<uint8_t>&)> on_resumed;
 };
 
 // Connection コールバック（前方宣言）
@@ -492,7 +507,7 @@ class Connection {
     return stream;
   }
 
-  void set_on_connected(std::function<void()> callback) {
+  void set_on_connected(std::function<void(bool)> callback) {
     std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_connected = std::move(callback);
   }
@@ -505,6 +520,76 @@ class Connection {
   void set_on_peer_stream_started(std::function<void(std::shared_ptr<Stream>)> callback) {
     std::lock_guard<std::mutex> lock(context_->mutex);
     context_->on_peer_stream_started = std::move(callback);
+  }
+
+  // DATAGRAM メソッド
+  void send_datagram(const nb::bytes& data, QUIC_SEND_FLAGS flags = QUIC_SEND_FLAG_NONE) {
+    auto* buf_data = new uint8_t[data.size()];
+    std::memcpy(buf_data, data.c_str(), data.size());
+
+    auto* buffer = new QUIC_BUFFER;
+    buffer->Length = static_cast<uint32_t>(data.size());
+    buffer->Buffer = buf_data;
+
+    QUIC_STATUS status;
+    {
+      nb::gil_scoped_release release;
+      status = g_MsQuic->DatagramSend(handle_, buffer, 1, flags, buffer);
+    }
+    if (QUIC_FAILED(status)) {
+      delete[] buf_data;
+      delete buffer;
+      throw std::runtime_error("Failed to send datagram");
+    }
+  }
+
+  void set_on_datagram_state_changed(std::function<void(bool, uint16_t)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    context_->on_datagram_state_changed = std::move(callback);
+  }
+
+  void set_on_datagram_received(std::function<void(const std::vector<uint8_t>&)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    context_->on_datagram_received = std::move(callback);
+  }
+
+  void set_on_datagram_send_state_changed(std::function<void(QUIC_DATAGRAM_SEND_STATE)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    context_->on_datagram_send_state_changed = std::move(callback);
+  }
+
+  // Resumption メソッド (サーバー側)
+  void send_resumption_ticket(QUIC_SEND_RESUMPTION_FLAGS flags = QUIC_SEND_RESUMPTION_FLAG_NONE) {
+    QUIC_STATUS status = g_MsQuic->ConnectionSendResumptionTicket(
+        handle_,
+        flags,
+        0,
+        nullptr);
+    if (QUIC_FAILED(status)) {
+      throw std::runtime_error("Failed to send resumption ticket");
+    }
+  }
+
+  // Resumption メソッド (クライアント側)
+  void set_resumption_ticket(const nb::bytes& ticket) {
+    QUIC_STATUS status = g_MsQuic->SetParam(
+        handle_,
+        QUIC_PARAM_CONN_RESUMPTION_TICKET,
+        static_cast<uint32_t>(ticket.size()),
+        ticket.c_str());
+    if (QUIC_FAILED(status)) {
+      throw std::runtime_error("Failed to set resumption ticket");
+    }
+  }
+
+  void set_on_resumption_ticket_received(std::function<void(const std::vector<uint8_t>&)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    context_->on_resumption_ticket_received = std::move(callback);
+  }
+
+  void set_on_resumed(std::function<void(const std::vector<uint8_t>&)> callback) {
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    context_->on_resumed = std::move(callback);
   }
 
  private:
@@ -521,14 +606,14 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
 
   switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED: {
-      std::function<void()> callback;
+      std::function<void(bool)> callback;
       {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         callback = ctx->on_connected;
       }
       if (callback) {
         nb::gil_scoped_acquire acquire;
-        callback();
+        callback(event->CONNECTED.SessionResumed != 0);
       }
       break;
     }
@@ -550,6 +635,11 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
         ctx->on_connected = nullptr;
         ctx->on_shutdown_complete = nullptr;
         ctx->on_peer_stream_started = nullptr;
+        ctx->on_datagram_state_changed = nullptr;
+        ctx->on_datagram_received = nullptr;
+        ctx->on_datagram_send_state_changed = nullptr;
+        ctx->on_resumption_ticket_received = nullptr;
+        ctx->on_resumed = nullptr;
         ctx->streams.clear();
       }
       // MsQuic のパターン: SHUTDOWN_COMPLETE で ConnectionClose を呼び出す
@@ -586,6 +676,85 @@ QUIC_STATUS QUIC_API ConnectionCallback(HQUIC connection, void* context, QUIC_CO
           event->PEER_STREAM_STARTED.Stream,
           (void*)StreamCallback,
           stream->context());
+      break;
+    }
+    case QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED: {
+      std::function<void(bool, uint16_t)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_datagram_state_changed;
+      }
+      if (callback) {
+        nb::gil_scoped_acquire acquire;
+        callback(event->DATAGRAM_STATE_CHANGED.SendEnabled != 0,
+                 event->DATAGRAM_STATE_CHANGED.MaxSendLength);
+      }
+      break;
+    }
+    case QUIC_CONNECTION_EVENT_DATAGRAM_RECEIVED: {
+      std::function<void(const std::vector<uint8_t>&)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_datagram_received;
+      }
+      if (callback) {
+        std::vector<uint8_t> data(
+            event->DATAGRAM_RECEIVED.Buffer->Buffer,
+            event->DATAGRAM_RECEIVED.Buffer->Buffer + event->DATAGRAM_RECEIVED.Buffer->Length);
+        nb::gil_scoped_acquire acquire;
+        callback(data);
+      }
+      break;
+    }
+    case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED: {
+      std::function<void(QUIC_DATAGRAM_SEND_STATE)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_datagram_send_state_changed;
+      }
+      if (callback) {
+        nb::gil_scoped_acquire acquire;
+        callback(event->DATAGRAM_SEND_STATE_CHANGED.State);
+      }
+      // 送信バッファを解放（最終状態の場合）
+      if (QUIC_DATAGRAM_SEND_STATE_IS_FINAL(event->DATAGRAM_SEND_STATE_CHANGED.State)) {
+        auto* buffer = static_cast<QUIC_BUFFER*>(event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+        if (buffer) {
+          delete[] buffer->Buffer;
+          delete buffer;
+        }
+      }
+      break;
+    }
+    case QUIC_CONNECTION_EVENT_RESUMPTION_TICKET_RECEIVED: {
+      std::function<void(const std::vector<uint8_t>&)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_resumption_ticket_received;
+      }
+      if (callback) {
+        std::vector<uint8_t> ticket(
+            event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket,
+            event->RESUMPTION_TICKET_RECEIVED.ResumptionTicket +
+                event->RESUMPTION_TICKET_RECEIVED.ResumptionTicketLength);
+        nb::gil_scoped_acquire acquire;
+        callback(ticket);
+      }
+      break;
+    }
+    case QUIC_CONNECTION_EVENT_RESUMED: {
+      std::function<void(const std::vector<uint8_t>&)> callback;
+      {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        callback = ctx->on_resumed;
+      }
+      if (callback) {
+        std::vector<uint8_t> state(
+            event->RESUMED.ResumptionState,
+            event->RESUMED.ResumptionState + event->RESUMED.ResumptionStateLength);
+        nb::gil_scoped_acquire acquire;
+        callback(state);
+      }
       break;
     }
     default:
@@ -772,6 +941,24 @@ void bind_enums(nb::module_& m) {
       .value("FIN", QUIC_SEND_FLAG_FIN)
       .value("DGRAM_PRIORITY", QUIC_SEND_FLAG_DGRAM_PRIORITY)
       .value("DELAY_SEND", QUIC_SEND_FLAG_DELAY_SEND);
+
+  nb::enum_<QUIC_DATAGRAM_SEND_STATE>(m, "DatagramSendState")
+      .value("UNKNOWN", QUIC_DATAGRAM_SEND_UNKNOWN)
+      .value("SENT", QUIC_DATAGRAM_SEND_SENT)
+      .value("LOST_SUSPECT", QUIC_DATAGRAM_SEND_LOST_SUSPECT)
+      .value("LOST_DISCARDED", QUIC_DATAGRAM_SEND_LOST_DISCARDED)
+      .value("ACKNOWLEDGED", QUIC_DATAGRAM_SEND_ACKNOWLEDGED)
+      .value("ACKNOWLEDGED_SPURIOUS", QUIC_DATAGRAM_SEND_ACKNOWLEDGED_SPURIOUS)
+      .value("CANCELED", QUIC_DATAGRAM_SEND_CANCELED);
+
+  nb::enum_<QUIC_SERVER_RESUMPTION_LEVEL>(m, "ServerResumptionLevel")
+      .value("NO_RESUME", QUIC_SERVER_NO_RESUME)
+      .value("RESUME_ONLY", QUIC_SERVER_RESUME_ONLY)
+      .value("RESUME_AND_ZERORTT", QUIC_SERVER_RESUME_AND_ZERORTT);
+
+  nb::enum_<QUIC_SEND_RESUMPTION_FLAGS>(m, "SendResumptionFlags")
+      .value("NONE", QUIC_SEND_RESUMPTION_FLAG_NONE)
+      .value("FINAL", QUIC_SEND_RESUMPTION_FLAG_FINAL);
 }
 
 // ========== Varint Functions ==========
@@ -849,9 +1036,11 @@ void bind_msquic(nb::module_& m) {
 
   // Configuration
   nb::class_<Configuration>(m, "Configuration")
-      .def(nb::init<Registration&, const std::vector<std::string>&, uint64_t, uint16_t, uint16_t>(),
+      .def(nb::init<Registration&, const std::vector<std::string>&, uint64_t, uint16_t, uint16_t, bool, QUIC_SERVER_RESUMPTION_LEVEL>(),
            "registration"_a, "alpn_list"_a, "idle_timeout_ms"_a = 0,
-           "peer_bidi_stream_count"_a = 0, "peer_unidi_stream_count"_a = 0)
+           "peer_bidi_stream_count"_a = 0, "peer_unidi_stream_count"_a = 0,
+           "datagram_receive_enabled"_a = false,
+           "server_resumption_level"_a = QUIC_SERVER_NO_RESUME)
       .def("load_credential_file", &Configuration::load_credential_file,
            "cert_file"_a, "key_file"_a, "is_client"_a = false)
       .def("load_credential_none", &Configuration::load_credential_none,
@@ -877,7 +1066,18 @@ void bind_msquic(nb::module_& m) {
       .def("open_stream", &Connection::open_stream, "flags"_a = QUIC_STREAM_OPEN_FLAG_NONE)
       .def("set_on_connected", &Connection::set_on_connected)
       .def("set_on_shutdown_complete", &Connection::set_on_shutdown_complete)
-      .def("set_on_peer_stream_started", &Connection::set_on_peer_stream_started);
+      .def("set_on_peer_stream_started", &Connection::set_on_peer_stream_started)
+      // DATAGRAM メソッド
+      .def("send_datagram", &Connection::send_datagram, "data"_a, "flags"_a = QUIC_SEND_FLAG_NONE)
+      .def("set_on_datagram_state_changed", &Connection::set_on_datagram_state_changed)
+      .def("set_on_datagram_received", &Connection::set_on_datagram_received)
+      .def("set_on_datagram_send_state_changed", &Connection::set_on_datagram_send_state_changed)
+      // Resumption メソッド
+      .def("send_resumption_ticket", &Connection::send_resumption_ticket,
+           "flags"_a = QUIC_SEND_RESUMPTION_FLAG_NONE)
+      .def("set_resumption_ticket", &Connection::set_resumption_ticket, "ticket"_a)
+      .def("set_on_resumption_ticket_received", &Connection::set_on_resumption_ticket_received)
+      .def("set_on_resumed", &Connection::set_on_resumed);
 
   // Listener
   nb::class_<Listener>(m, "Listener")
