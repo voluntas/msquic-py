@@ -16,6 +16,8 @@ msquic-py は Microsoft の [MsQuic](https://github.com/microsoft/msquic) ライ
 - MsQuic の Python バインディング
   - QUIC クライアント/サーバー
   - 双方向/単方向ストリーム
+  - QUIC DATAGRAM (RFC 9221)
+  - 0-RTT / Session Resumption
   - 証明書のカスタム検証
 - MOQT (Media over QUIC Transport) 実装
   - draft-ietf-moq-transport-15 準拠
