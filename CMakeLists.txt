@@ -49,17 +49,13 @@ set(MSQUIC_SOURCE_DIR "${DEPS_DIR}/msquic/${MSQUIC_VERSION}/source")
 set(MSQUIC_BUILD_DIR "${DEPS_DIR}/msquic/${MSQUIC_VERSION}/build")
 set(MSQUIC_INSTALL_DIR "${DEPS_DIR}/msquic/${MSQUIC_VERSION}/install")
 
-# ライブラリパス設定
-# Windows では schannel を使用するため msquic.dll を出力
-# macOS/Linux では quictls を使用
+# 静的ライブラリパス設定
 if(WIN32)
-  set(MSQUIC_STATIC_LIB ${MSQUIC_INSTALL_DIR}/lib/msquic.lib)
-  set(MSQUIC_SHARED_LIB ${MSQUIC_INSTALL_DIR}/bin/msquic.dll)
-  set(MSQUIC_LIB ${MSQUIC_STATIC_LIB})
+  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/msquic.lib)
 elseif(APPLE)
-  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/libmsquic.dylib)
+  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/libmsquic.a)
 else()
-  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/libmsquic.so)
+  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/libmsquic.a)
 endif()
 
 # ビルド済みかチェック
@@ -76,12 +72,13 @@ else()
     -DQUIC_BUILD_TOOLS=OFF
     -DQUIC_BUILD_TEST=OFF
     -DQUIC_BUILD_PERF=OFF
+    -DQUIC_BUILD_SHARED=OFF
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
   )
 
   # プラットフォーム固有の TLS 設定
   # Windows: schannel (Windows 組み込み、OpenSSL 不要)
-  # macOS/Linux: quictls + システムの OpenSSL を使用
+  # macOS/Linux: quictls を静的リンク
   if(WIN32)
     set(MSQUIC_CMAKE_CACHE_ARGS
       -DQUIC_TLS_LIB:STRING=schannel
@@ -89,7 +86,7 @@ else()
   else()
     set(MSQUIC_CMAKE_CACHE_ARGS
       -DQUIC_TLS_LIB:STRING=quictls
-      -DQUIC_USE_SYSTEM_LIBCRYPTO:BOOL=ON
+      -DQUIC_USE_SYSTEM_LIBCRYPTO:BOOL=OFF
     )
   endif()
 
@@ -137,15 +134,10 @@ if(APPLE)
     "-framework CoreFoundation"
     "-framework Security"
   )
-  # RPATH設定
-  set_target_properties(msquic_ext PROPERTIES
-    BUILD_RPATH "${MSQUIC_INSTALL_DIR}/lib"
-    INSTALL_RPATH "@loader_path"
-  )
 elseif(WIN32)
   # 文字コードを utf-8 として扱うのと、シンボルテーブル数を増やす
   target_compile_options(msquic_ext PRIVATE /utf-8 /bigobj)
-  # CRTライブラリを静的リンクさせる
+  # CRT ライブラリを静的リンクさせる
   set_property(TARGET msquic_ext PROPERTY
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   set_property(TARGET nanobind-static PROPERTY
@@ -155,12 +147,6 @@ elseif(WIN32)
     _WIN32_WINNT=0x0A00
     NOMINMAX
     WIN32_LEAN_AND_MEAN
-  )
-else()
-  # Linux RPATH設定
-  set_target_properties(msquic_ext PROPERTIES
-    BUILD_RPATH "${MSQUIC_INSTALL_DIR}/lib"
-    INSTALL_RPATH "$ORIGIN"
   )
 endif()
 
@@ -191,17 +177,3 @@ install(TARGETS msquic_ext
 # 型スタブファイルとマーカーファイルをインストール
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/__init__.pyi DESTINATION ${PY_PACKAGE})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/py.typed DESTINATION ${PY_PACKAGE})
-
-# 共有ライブラリをパッケージに含める
-if(WIN32)
-  # Windows では msquic.dll をコピー
-  install(FILES ${MSQUIC_SHARED_LIB} DESTINATION ${PY_PACKAGE})
-elseif(APPLE)
-  # macOS ではバージョン付き .dylib ファイルもコピー
-  file(GLOB MSQUIC_DYLIB_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic*.dylib")
-  install(FILES ${MSQUIC_DYLIB_FILES} DESTINATION ${PY_PACKAGE})
-else()
-  # Linux では .so ファイルをコピー
-  file(GLOB MSQUIC_SO_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic.so*")
-  install(FILES ${MSQUIC_SO_FILES} DESTINATION ${PY_PACKAGE})
-endif()

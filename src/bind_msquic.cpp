@@ -20,6 +20,20 @@
 #ifndef CXPLAT_ANALYSIS_ASSERT
 #define CXPLAT_ANALYSIS_ASSERT(exp)
 #endif
+
+// バイトスワップ関数: Windows (MSVC) と GCC/Clang で異なる
+#ifdef _MSC_VER
+#include <stdlib.h>
+#ifndef CxPlatByteSwapUint16
+#define CxPlatByteSwapUint16(value) _byteswap_ushort((unsigned short)(value))
+#endif
+#ifndef CxPlatByteSwapUint32
+#define CxPlatByteSwapUint32(value) _byteswap_ulong((unsigned long)(value))
+#endif
+#ifndef CxPlatByteSwapUint64
+#define CxPlatByteSwapUint64(value) _byteswap_uint64((unsigned long long)(value))
+#endif
+#else
 #ifndef CxPlatByteSwapUint16
 #define CxPlatByteSwapUint16(value) __builtin_bswap16((unsigned short)(value))
 #endif
@@ -28,6 +42,7 @@
 #endif
 #ifndef CxPlatByteSwapUint64
 #define CxPlatByteSwapUint64(value) __builtin_bswap64((value))
+#endif
 #endif
 
 #include <quic_var_int.h>
