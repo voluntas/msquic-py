@@ -50,8 +50,12 @@ set(MSQUIC_BUILD_DIR "${DEPS_DIR}/msquic/${MSQUIC_VERSION}/build")
 set(MSQUIC_INSTALL_DIR "${DEPS_DIR}/msquic/${MSQUIC_VERSION}/install")
 
 # ライブラリパス設定
+# Windows では schannel を使用するため msquic.dll を出力
+# macOS/Linux では quictls を使用
 if(WIN32)
-  set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/msquic.lib)
+  set(MSQUIC_STATIC_LIB ${MSQUIC_INSTALL_DIR}/lib/msquic.lib)
+  set(MSQUIC_SHARED_LIB ${MSQUIC_INSTALL_DIR}/bin/msquic.dll)
+  set(MSQUIC_LIB ${MSQUIC_STATIC_LIB})
 elseif(APPLE)
   set(MSQUIC_LIB ${MSQUIC_INSTALL_DIR}/lib/libmsquic.dylib)
 else()
@@ -65,7 +69,7 @@ if(EXISTS ${MSQUIC_LIB})
 else()
   message(STATUS "Building msquic...")
 
-  # プラットフォーム固有のCMake引数
+  # プラットフォーム共通の CMake 引数
   set(MSQUIC_CMAKE_ARGS
     -DCMAKE_INSTALL_PREFIX=${MSQUIC_INSTALL_DIR}
     -DCMAKE_BUILD_TYPE=Release
@@ -75,12 +79,19 @@ else()
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
   )
 
-  # CACHE 変数は CMAKE_CACHE_ARGS で渡す必要がある
-  # quictls を使うが、システムの OpenSSL を使用する
-  set(MSQUIC_CMAKE_CACHE_ARGS
-    -DQUIC_TLS_LIB:STRING=quictls
-    -DQUIC_USE_SYSTEM_LIBCRYPTO:BOOL=ON
-  )
+  # プラットフォーム固有の TLS 設定
+  # Windows: schannel (Windows 組み込み、OpenSSL 不要)
+  # macOS/Linux: quictls + システムの OpenSSL を使用
+  if(WIN32)
+    set(MSQUIC_CMAKE_CACHE_ARGS
+      -DQUIC_TLS_LIB:STRING=schannel
+    )
+  else()
+    set(MSQUIC_CMAKE_CACHE_ARGS
+      -DQUIC_TLS_LIB:STRING=quictls
+      -DQUIC_USE_SYSTEM_LIBCRYPTO:BOOL=ON
+    )
+  endif()
 
   ExternalProject_Add(
     msquic_build
@@ -182,11 +193,14 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/__init__.pyi DESTINATION ${PY_PACKAGE}
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/py.typed DESTINATION ${PY_PACKAGE})
 
 # 共有ライブラリをパッケージに含める
-if(APPLE)
+if(WIN32)
+  # Windows では msquic.dll をコピー
+  install(FILES ${MSQUIC_SHARED_LIB} DESTINATION ${PY_PACKAGE})
+elseif(APPLE)
   # macOS ではバージョン付き .dylib ファイルもコピー
   file(GLOB MSQUIC_DYLIB_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic*.dylib")
   install(FILES ${MSQUIC_DYLIB_FILES} DESTINATION ${PY_PACKAGE})
-elseif(UNIX)
+else()
   # Linux では .so ファイルをコピー
   file(GLOB MSQUIC_SO_FILES "${MSQUIC_INSTALL_DIR}/lib/libmsquic.so*")
   install(FILES ${MSQUIC_SO_FILES} DESTINATION ${PY_PACKAGE})
